@@ -1,0 +1,260 @@
+name: PR preview (ephemeral sigma worker)
+
+# Ephemeral per-PR preview of the SSR explorer. Each open PR gets its own Worker at
+# https://<prefix>-<PR number>.<account-subdomain>.workers.dev, deleted when the PR closes.
+#
+# Design (see docs/dev-environments.md):
+#   - Web worker ONLY. The ETL worker is cron-only and WRITES D1 — we never spin a per-PR copy of it.
+#   - Previews SHARE the long-lived dev D1 + dev R2 buckets (read-only from the preview worker). No
+#     per-PR data provisioning, no per-PR seed — the preview shows the same data the dev env has.
+#   - NO migrations. deploy.yml applies schema changes to staging/production; a preview must never run
+#     them against the shared dev D1 (docs/dev-environments.md).
+#   - All credentials come from a `preview` GitHub Environment whose SIGMA_D1_ID points at the dev D1.
+#     Keep that environment WITHOUT required reviewers, or every preview deploy will block.
+#
+# Naming: the worker name is DERIVED, not configured — `sigma-<repo owner>-pr-<PR number>`, computed by
+# scripts/preview-name.mjs. This repo, lyubomir-bozhinov/sigma and midt-bg/sigma all deploy previews into
+# ONE shared Cloudflare account, so a bare `sigma-pr-<n>` scheme collides whenever two forks reach the
+# same PR number — the second deploy silently overwrites the first, and each repo's reaper deletes the
+# other's workers. Deriving from the owner makes that structurally impossible with nothing to configure.
+#
+# Security: fork PRs cannot read repo secrets, so the deploy/teardown jobs are gated to same-repo
+# branches. Fork PRs still get normal CI from ci.yml; they just don't get a live preview.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+
+concurrency:
+  group: preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+# Least-privilege default; the deploy/teardown jobs raise pull-requests:write for their PR comment.
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    if: >-
+      github.event.action != 'closed' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    # Build + single-Worker deploy is a few minutes; cap well under the 360-min default so a wedged
+    # wrangler or stalled network fails fast instead of holding a runner for hours.
+    timeout-minutes: 10
+    environment: preview
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      # Shared dev data: SIGMA_D1_ID is the dev database's id (set on the `preview` Environment).
+      SIGMA_D1_ID: ${{ secrets.SIGMA_D1_ID }}
+      SIGMA_D1_NAME: ${{ vars.SIGMA_D1_NAME }}
+      SIGMA_CSV_CACHE_NAME: ${{ vars.SIGMA_CSV_CACHE_NAME }}
+      # Assistant resources are shared with dev (one Vectorize index + one reports bucket, no per-preview
+      # seed). The committed defaults name the PRODUCTION resources, which do not exist on the dev
+      # account — set these on the `preview` Environment or the REPORTS/VECTORIZE bindings fail to resolve.
+      SIGMA_REPORTS_NAME: ${{ vars.SIGMA_REPORTS_NAME }}
+      SIGMA_VECTORIZE_NAME: ${{ vars.SIGMA_VECTORIZE_NAME }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: pnpm
+
+      # Before the install, so a bad owner/prefix fails in seconds rather than after a full build.
+      # Exported through $GITHUB_ENV rather than interpolated in YAML on purpose: `github.repository_owner`
+      # preserves the login's original case and a Worker name must be lowercase. PREVIEW_WORKER_PREFIX is
+      # passed at STEP scope only — the resolved value the script writes is what every later step reads,
+      # so deploy, teardown and the reaper can never disagree about the name.
+      - name: Compute preview worker name
+        env:
+          PREVIEW_WORKER_PREFIX: ${{ vars.PREVIEW_WORKER_PREFIX }}
+        run: node scripts/preview-name.mjs --pr "${{ github.event.pull_request.number }}"
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Guard — require preview credentials
+        run: |
+          missing=()
+          [ -z "${CLOUDFLARE_API_TOKEN}" ] && missing+=("CLOUDFLARE_API_TOKEN")
+          [ -z "${CLOUDFLARE_ACCOUNT_ID}" ] && missing+=("CLOUDFLARE_ACCOUNT_ID")
+          [ -z "${SIGMA_D1_ID}" ]          && missing+=("SIGMA_D1_ID")
+          [ -z "${SIGMA_D1_NAME}" ]        && missing+=("SIGMA_D1_NAME (var)")
+          [ -z "${SIGMA_CSV_CACHE_NAME}" ] && missing+=("SIGMA_CSV_CACHE_NAME (var)")
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::preview Environment is missing: ${missing[*]} — see docs/dev-environments-setup.md."
+            exit 1
+          fi
+
+      # Defense in depth: SIGMA_WEB_NAME is derived and can't collide, but the shared-data names come from
+      # the `preview` Environment. Refuse the production D1/R2 names so a misconfigured environment can't
+      # point previews at the live `sigma` data. Previews are meant to read the dev D1/R2 only.
+      - name: Guard — preview must not point at production data
+        run: |
+          fail=0
+          check() {  # $1=value  $2=prod default  $3=var name
+            if [ "$1" = "$2" ]; then
+              echo "::error::$3 must not be the production value '$2' for a preview — set it to the dev resource on the 'preview' Environment (see docs/dev-environments.md)."
+              fail=1
+            fi
+          }
+          check "$SIGMA_D1_NAME"        sigma           SIGMA_D1_NAME
+          check "$SIGMA_CSV_CACHE_NAME" sigma-csv-cache SIGMA_CSV_CACHE_NAME
+          check "$SIGMA_REPORTS_NAME"   sigma-reports   SIGMA_REPORTS_NAME
+          check "$SIGMA_VECTORIZE_NAME" sigma-assistant SIGMA_VECTORIZE_NAME
+          [ "$fail" = 0 ] || exit 1
+
+      - name: Deploy preview worker
+        id: deploy
+        run: |
+          set -o pipefail
+          # `run deploy` builds, renders wrangler.deploy.json with SIGMA_WEB_NAME/SIGMA_D1_*, and deploys.
+          pnpm --filter @sigma/web run deploy 2>&1 | tee deploy.log
+          # The live URL includes the account subdomain (<worker>.<account-subdomain>.workers.dev), which
+          # can't be reconstructed from SIGMA_WEB_NAME alone — so parse it from wrangler's output. If
+          # parsing fails, leave it empty; the comment step says so rather than posting a dead link.
+          url="$(grep -Eo 'https://[a-zA-Z0-9.-]+\.workers\.dev' deploy.log | head -n1)"
+          if [ -z "$url" ]; then
+            echo "::warning::Could not parse the preview URL from wrangler output; see the deploy log above."
+          fi
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      # The BgGPT key is a per-worker-script secret, so a freshly-deployed preview worker does NOT inherit
+      # it from the dev worker — set it here so /assistant/chat works in the preview (the assistant binds
+      # the shared dev Vectorize/R2 by name, but the key must be attached per script). Runs AFTER the
+      # deploy: the worker must exist before a secret can be put on it. Optional + fails OPEN: if
+      # BGGPT_API_KEY is unset on the `preview` Environment, skip it — the assistant degrades to a
+      # controlled 503 (UI-only preview), which must NOT fail an otherwise-good preview deploy.
+      - name: Provision assistant key (BGGPT_API_KEY) on the preview worker
+        env:
+          BGGPT_API_KEY: ${{ secrets.BGGPT_API_KEY }}
+        run: |
+          if [ -z "${BGGPT_API_KEY}" ]; then
+            echo "::notice::BGGPT_API_KEY is not set on the 'preview' Environment — the assistant will 503 in this preview (UI only). See docs/dev-environments.md."
+            exit 0
+          fi
+          printf '%s' "${BGGPT_API_KEY}" | pnpm --filter @sigma/web exec wrangler secret put BGGPT_API_KEY --name "$SIGMA_WEB_NAME"
+
+      - name: Comment preview URL on PR
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          PREVIEW_URL: ${{ steps.deploy.outputs.url }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          script: |
+            const url = process.env.PREVIEW_URL;
+            const worker = process.env.SIGMA_WEB_NAME;
+            const marker = '<!-- sigma-preview -->';
+            const headline = url
+              ? `🌐 **Preview deployed** → ${url}`
+              : `🌐 **Preview deployed**, but the URL couldn't be auto-detected — see the "Deploy preview worker" step in the [workflow run](${process.env.RUN_URL}).`;
+            const body = `${marker}\n${headline}\n\n` +
+              `Worker \`${worker}\` · shares the **dev** D1 (read-only). Updates on each push; removed when this PR closes.`;
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number,
+            });
+            const existing = comments.find((c) => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo, comment_id: existing.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body,
+              });
+            }
+
+      # Render the live preview location into the run's Job Summary (the box on the Actions run page),
+      # so the URL is discoverable straight from the workflow run — not only the PR comment.
+      - name: Preview environment summary
+        env:
+          PREVIEW_URL: ${{ steps.deploy.outputs.url }}
+        run: |
+          {
+            echo "## 🌐 Preview environment"
+            echo
+            if [ -n "$PREVIEW_URL" ]; then
+              echo "✅ **Deployed** → [$PREVIEW_URL]($PREVIEW_URL)"
+            else
+              echo "⚠️ Deployed, but the URL couldn't be auto-detected — see the **Deploy preview worker** step log."
+            fi
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Worker | \`$SIGMA_WEB_NAME\` (web/SSR only — no per-PR ETL) |"
+            echo "| Data | shares the **dev** D1 \`$SIGMA_D1_NAME\` + R2 \`$SIGMA_CSV_CACHE_NAME\` (read-only) |"
+            echo "| Lifecycle | redeployed on each push · torn down when this PR closes |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  teardown:
+    if: >-
+      github.event.action == 'closed' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    # Teardown must run to completion — never let a racing deploy (same PR, shared workflow-level group)
+    # cancel it and orphan the preview worker. Own group, no cancellation; the deletion is idempotent.
+    concurrency:
+      group: preview-teardown-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    # Just an idempotent worker delete — minutes at most. Cap low vs the 360-min default.
+    timeout-minutes: 5
+    environment: preview
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: pnpm
+
+      # Same derivation as the deploy job — one module, so a preview can never be deployed under a name
+      # the teardown allowlist won't match. Exports both PREVIEW_WORKER_PREFIX and SIGMA_WEB_NAME;
+      # teardown-remote.mjs reads the prefix to build its `<prefix>-<digits>` allowlist.
+      - name: Compute preview worker name
+        env:
+          PREVIEW_WORKER_PREFIX: ${{ vars.PREVIEW_WORKER_PREFIX }}
+        run: node scripts/preview-name.mjs --pr "${{ github.event.pull_request.number }}"
+
+      - run: pnpm install --frozen-lockfile
+
+      # Deletes only this repository's per-PR worker. The shared dev D1/R2 are never touched, and neither
+      # is another fork's preview — teardown-remote.mjs refuses protected names and anything outside
+      # `<prefix>-<digits>`. Run through `pnpm --filter @sigma/web exec` so the web package's pinned
+      # wrangler is on PATH; the script shells out to it.
+      - name: Delete preview worker
+        run: pnpm --filter @sigma/web exec node ../../scripts/teardown-remote.mjs --name "$SIGMA_WEB_NAME"
+
+      - name: Teardown summary
+        run: |
+          {
+            echo "## 🧹 Preview environment"
+            echo
+            echo "Worker \`$SIGMA_WEB_NAME\` was torn down (PR closed). The shared dev D1/R2 are untouched."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Note teardown on PR
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const marker = '<!-- sigma-preview -->';
+            const body = `${marker}\n🧹 Preview \`${process.env.SIGMA_WEB_NAME}\` torn down (PR closed).`;
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number,
+            });
+            const existing = comments.find((c) => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo, comment_id: existing.id, body,
+              });
+            }
