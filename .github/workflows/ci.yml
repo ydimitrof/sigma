@@ -90,6 +90,15 @@ jobs:
       - name: Test
         if: ${{ !cancelled() }}
         run: pnpm test -- --coverage
+      # `pnpm test` runs the workspace (turbo) suites; the repo-root scripts/ live outside any
+      # workspace and are exercised by node:test instead. Matters most for the preview pipeline
+      # (preview-name / teardown-remote / reap-previews), whose allowlist logic issues real
+      # `wrangler delete` calls against a Cloudflare account shared with the other forks —
+      # docs/dev-environments.md. The glob re-runs the docs/coverage checker tests that have their
+      # own steps below; they are fast, and one glob is harder to forget than a per-file list.
+      - name: Script tests
+        if: ${{ !cancelled() }}
+        run: pnpm test:scripts
       # Coverage ratchet (#93): per-workspace lines/branches may not drop below
       # coverage-baseline.json (0.5pp tolerance). The checker self-tests first,
       # so the gate is itself gated — same pattern as the docs check below.
